@@ -54,30 +54,40 @@ def batchnorm_to_float(module):
     return module
 
 
-def lstmcell_to_float(module):
-    """Converts LSTMCells modules to FP32"""
-    if isinstance(module, torch.nn.LSTMCell):
-        module.float()
+def init_bn(module):
+    if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+        if module.affine:
+            module.weight.data.uniform_()
     for child in module.children():
-        lstmcell_to_float(child)
-    return module
+        init_bn(child)
 
 
-def get_model(model_name, model_config, to_fp16, to_cuda, training=True):
+def get_model(model_name, model_config, to_cuda,
+              uniform_initialize_bn_weight=False, forward_is_infer=False):
     """ Code chooses a model based on name"""
     model = None
     if model_name == 'Tacotron2':
-        model = Tacotron2(**model_config)
+        if forward_is_infer:
+            class Tacotron2__forward_is_infer(Tacotron2):
+                def forward(self, inputs, input_lengths):
+                    return self.infer(inputs, input_lengths)
+            model = Tacotron2__forward_is_infer(**model_config)
+        else:
+            model = Tacotron2(**model_config)
     elif model_name == 'WaveGlow':
-        model = WaveGlow(**model_config)
+        if forward_is_infer:
+            class WaveGlow__forward_is_infer(WaveGlow):
+                def forward(self, spect, sigma=1.0):
+                    return self.infer(spect, sigma)
+            model = WaveGlow__forward_is_infer(**model_config)
+        else:
+            model = WaveGlow(**model_config)
     else:
         raise NotImplementedError(model_name)
-    if to_fp16:
-        model = batchnorm_to_float(model.half())
-        model = lstmcell_to_float(model)
-        if model_name == "WaveGlow":
-            for k in model.convinv:
-                k.float()
+
+    if uniform_initialize_bn_weight:
+        init_bn(model)
+
     if to_cuda:
         model = model.cuda()
     return model

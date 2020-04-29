@@ -39,18 +39,20 @@ from torch.nn.parameter import Parameter
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 
-from apex.fp16_utils import FP16_Optimizer
 from apex.parallel import DistributedDataParallel as DDP
 
 import models
 import loss_functions
 import data_functions
 
-from dllogger.logger import LOGGER
-import dllogger.logger as dllg
-from dllogger import tags
-from dllogger.autologging import log_hardware, log_args
+import dllogger as DLLogger
+from dllogger import StdOutBackend, JSONStreamBackend, Verbosity
+
 from scipy.io.wavfile import write as write_wav
+
+from apex import amp
+amp.lists.functional_overrides.FP32_FUNCS.remove('softmax')
+amp.lists.functional_overrides.FP16_FUNCS.append('softmax')
 
 
 def parse_args(parser):
@@ -58,7 +60,7 @@ def parse_args(parser):
     Parse commandline arguments.
     """
 
-    parser.add_argument('-o', '--output_directory', type=str, required=True,
+    parser.add_argument('-o', '--output', type=str, required=True,
                         help='Directory to save checkpoints')
     parser.add_argument('-d', '--dataset-path', type=str,
                         default='./', help='Path to dataset')
@@ -66,12 +68,6 @@ def parse_args(parser):
                         help='Model to train')
     parser.add_argument('--log-file', type=str, default='nvlog.json',
                         help='Filename for logging')
-    parser.add_argument('--phrase-path', type=str, default=None,
-                        help='Path to phrase sequence file used for sample generation')
-    parser.add_argument('--waveglow-checkpoint', type=str, default=None,
-                        help='Path to pre-trained WaveGlow checkpoint for sample generation')
-    parser.add_argument('--tacotron2-checkpoint', type=str, default=None,
-                        help='Path to pre-trained Tacotron2 checkpoint for sample generation')
     parser.add_argument('--anneal-steps', nargs='*',
                         help='Epochs after which decrease learning rate')
     parser.add_argument('--anneal-factor', type=float, choices=[0.1, 0.3], default=0.1,
@@ -79,20 +75,22 @@ def parse_args(parser):
 
     # training
     training = parser.add_argument_group('training setup')
-    training.add_argument('--epochs', type=int, required=True,  # default=1500,
+    training.add_argument('--epochs', type=int, required=True,
                           help='Number of total epochs to run')
-    training.add_argument('--epochs-per-checkpoint', type=int, default=10,
+    training.add_argument('--epochs-per-checkpoint', type=int, default=50,
                           help='Number of epochs per checkpoint')
-    training.add_argument('--seed', type=int, default=1234,
-                          help='Seed for PyTorch random number generators')
+    training.add_argument('--checkpoint-path', type=str, default='',
+                          help='Checkpoint path to resume training')
     training.add_argument('--dynamic-loss-scaling', type=bool, default=True,
                           help='Enable dynamic loss scaling')
-    training.add_argument('--fp16-run', action='store_true',
-                          help='Enable fp16')
-    training.add_argument('--cudnn-enabled', type=bool, default=True,
+    training.add_argument('--amp-run', action='store_true',
+                          help='Enable AMP')
+    training.add_argument('--cudnn-enabled', action='store_true',
                           help='Enable cudnn')
-    training.add_argument('--cudnn-benchmark', type=bool, default=False,
+    training.add_argument('--cudnn-benchmark', action='store_true',
                           help='Run cudnn benchmark')
+    training.add_argument('--disable-uniform-initialize-bn-weight', action='store_true',
+                          help='disable uniform initialization of batchnorm layer weight')
 
     optimization = parser.add_argument_group('optimization setup')
     optimization.add_argument(
@@ -110,7 +108,7 @@ def parse_args(parser):
 
     # dataset parameters
     dataset = parser.add_argument_group('dataset parameters')
-    dataset.add_argument('--load-mel-from-disk', default=False, type=bool,
+    dataset.add_argument('--load-mel-from-disk', action='store_true',
                          help='Loads mel spectrograms from disk instead of computing them on the fly')
     dataset.add_argument('--training-files',
                          default='filelists/ljs_audio_text_train_filelist.txt',
@@ -153,6 +151,9 @@ def parse_args(parser):
     distributed.add_argument('--dist-backend', default='nccl', type=str, choices={'nccl'},
                              help='Distributed run backend')
 
+    benchmark = parser.add_argument_group('benchmark')
+    benchmark.add_argument('--bench-class', type=str, default='')
+
     return parser
 
 
@@ -161,46 +162,6 @@ def reduce_tensor(tensor, num_gpus):
     dist.all_reduce(rt, op=dist.reduce_op.SUM)
     rt /= num_gpus
     return rt
-
-
-# shamelessly copied from apex/fp16_utils/fp16_optimizer.py
-# commit 34582381e289287e6d09490b69c0840718729f2e
-FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
-HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
-
-
-def conversion_helper(val, conversion):
-    """Apply conversion to val. Recursively apply conversion if `val` is a nested tuple/list structure."""
-    if not isinstance(val, (tuple, list)):
-        return conversion(val)
-    rtn = [conversion_helper(v, conversion) for v in val]
-    if isinstance(val, tuple):
-        rtn = tuple(rtn)
-    return rtn
-
-
-def fp32_to_fp16(val):
-    """Convert fp32 `val` to fp16"""
-    def half_conversion(val):
-        val_typecheck = val
-        if isinstance(val_typecheck, (Parameter, Variable)):
-            val_typecheck = val.data
-        if isinstance(val_typecheck, FLOAT_TYPES):
-            val = val.half()
-        return val
-    return conversion_helper(val, half_conversion)
-
-
-def fp16_to_fp32(val):
-    """Convert fp16 `val` to fp32"""
-    def float_conversion(val):
-        val_typecheck = val
-        if isinstance(val_typecheck, (Parameter, Variable)):
-            val_typecheck = val.data
-        if isinstance(val_typecheck, HALF_TYPES):
-            val = val.float()
-        return val
-    return conversion_helper(val, float_conversion)
 
 
 def init_distributed(args, world_size, rank, group_name):
@@ -218,60 +179,38 @@ def init_distributed(args, world_size, rank, group_name):
     print("Done initializing distributed")
 
 
-def save_checkpoint(model, epoch, config, filepath):
+def save_checkpoint(model, optimizer, epoch, config, amp_run, filepath):
     print("Saving model and optimizer state at epoch {} to {}".format(
         epoch, filepath))
-    torch.save({'epoch': epoch,
-                'config': config,
-                'state_dict': model.state_dict()}, filepath)
+    checkpoint = {'epoch': epoch,
+                  'cuda_rng_state_all': torch.cuda.get_rng_state_all(),
+                  'random_rng_state': torch.random.get_rng_state(),
+                  'config': config,
+                  'state_dict': model.state_dict(),
+                  'optimizer': optimizer.state_dict()}
+    if amp_run:
+        checkpoint['amp'] = amp.state_dict()
+
+    torch.save(checkpoint, filepath)
 
 
-def save_sample(model_name, model, waveglow_path, tacotron2_path, phrase_path, filepath, sampling_rate, fp16):
-    if phrase_path is None:
-        return
-    phrase = torch.load(phrase_path, map_location='cpu')
-    if model_name == 'Tacotron2':
-        if waveglow_path is None:
-            raise Exception(
-                "WaveGlow checkpoint path is missing, could not generate sample")
-        with torch.no_grad():
-            checkpoint = torch.load(waveglow_path, map_location='cpu')
-            waveglow = models.get_model(
-                'WaveGlow', checkpoint['config'], to_fp16=False, to_cuda=False)
-            waveglow.eval()
-            model.eval()
-            mel = model.infer(phrase.cuda())[0].cpu()
-            model.train()
-            if fp16:
-                mel = mel.float()
-            audio = waveglow.infer(mel, sigma=0.6)
-    elif model_name == 'WaveGlow':
-        if tacotron2_path is None:
-            raise Exception(
-                "Tacotron2 checkpoint path is missing, could not generate sample")
-        with torch.no_grad():
-            checkpoint = torch.load(tacotron2_path, map_location='cpu')
-            tacotron2 = models.get_model(
-                'Tacotron2', checkpoint['config'], to_fp16=False, to_cuda=False)
-            tacotron2.eval()
-            mel = tacotron2.infer(phrase)[0].cuda()
-            model.eval()
-            if fp16:
-                mel = mel.half()
-            audio = model.infer(mel, sigma=0.6).cpu()
-            model.train()
-            if fp16:
-                audio = audio.float()
-    else:
-        raise NotImplementedError(
-            "unknown model requested: {}".format(model_name))
-    audio = audio[0].numpy()
-    audio = audio.astype('int16')
-    write_wav(filepath, sampling_rate, audio)
+def load_checkpoint(model, optimizer, epoch, config, amp_run, filepath, rank):
+
+    checkpoint = torch.load(filepath, map_location='cpu')
+
+    epoch[0] = checkpoint['epoch']+1
+    device_id = rank % torch.cuda.device_count()
+    torch.cuda.set_rng_state(checkpoint['cuda_rng_state_all'][device_id])
+    torch.random.set_rng_state(checkpoint['random_rng_state'])
+    config = checkpoint['config']
+    model.load_state_dict(checkpoint['state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+
+    if amp_run:
+        amp.load_state_dict(checkpoint['amp'])
 
 # adapted from: https://discuss.pytorch.org/t/opinion-eval-should-be-a-context-manager/18998/3
 # Following snippet is licensed under MIT license
-
 
 @contextmanager
 def evaluating(model):
@@ -285,8 +224,8 @@ def evaluating(model):
             model.train()
 
 
-def validate(model, criterion, valset, iteration, batch_size, world_size,
-             collate_fn, distributed_run, rank, batch_to_gpu, fp16_run):
+def validate(model, criterion, valset, epoch, batch_iter, batch_size,
+             world_size, collate_fn, distributed_run, rank, batch_to_gpu):
     """Handles all the validation scoring and printing"""
     with evaluating(model), torch.no_grad():
         val_sampler = DistributedSampler(valset) if distributed_run else None
@@ -296,26 +235,42 @@ def validate(model, criterion, valset, iteration, batch_size, world_size,
                                 collate_fn=collate_fn)
 
         val_loss = 0.0
+        num_iters = 0
+        val_items_per_sec = 0.0
         for i, batch in enumerate(val_loader):
-            x, y, len_x = batch_to_gpu(batch)
-            if fp16_run:
-                y_pred = model(fp32_to_fp16(x))
-                loss = criterion(fp16_to_fp32(y_pred), y)
-            else:
-                y_pred = model(x)
-                loss = criterion(y_pred, y)
+            torch.cuda.synchronize()
+            iter_start_time = time.perf_counter()
+
+            x, y, num_items = batch_to_gpu(batch)
+            y_pred = model(x)
+            loss = criterion(y_pred, y)
             if distributed_run:
                 reduced_val_loss = reduce_tensor(loss.data, world_size).item()
+                reduced_num_items = reduce_tensor(num_items.data, 1).item()
             else:
                 reduced_val_loss = loss.item()
+                reduced_num_items = num_items.item()
             val_loss += reduced_val_loss
-        val_loss = val_loss / (i + 1)
 
-    LOGGER.log(key="val_iter_loss", value=reduced_val_loss)
+            torch.cuda.synchronize()
+            iter_stop_time = time.perf_counter()
+            iter_time = iter_stop_time - iter_start_time
 
+            items_per_sec = reduced_num_items/iter_time
+            DLLogger.log(step=(epoch, batch_iter, i), data={'val_items_per_sec': items_per_sec})
+            val_items_per_sec += items_per_sec
+            num_iters += 1
 
-def adjust_learning_rate(epoch, optimizer, learning_rate,
-                         anneal_steps, anneal_factor):
+        val_loss = val_loss/(i + 1)
+
+        DLLogger.log(step=(epoch,), data={'val_loss': val_loss})
+        DLLogger.log(step=(epoch,), data={'val_items_per_sec':
+                                         (val_items_per_sec/num_iters if num_iters > 0 else 0.0)})
+
+        return val_loss
+
+def adjust_learning_rate(iteration, epoch, optimizer, learning_rate,
+                         anneal_steps, anneal_factor, rank):
 
     p = 0
     if anneal_steps is not None:
@@ -329,8 +284,7 @@ def adjust_learning_rate(epoch, optimizer, learning_rate,
         lr = learning_rate*(anneal_factor ** p)
 
     if optimizer.param_groups[0]['lr'] != lr:
-        LOGGER.log_event("learning_rate changed",
-                         value=str(optimizer.param_groups[0]['lr']) + " -> " + str(lr))
+        DLLogger.log(step=(epoch, iteration), data={'learning_rate changed': str(optimizer.param_groups[0]['lr'])+" -> "+str(lr)})
 
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -342,67 +296,67 @@ def main():
     parser = parse_args(parser)
     args, _ = parser.parse_known_args()
 
-    LOGGER.set_model_name("Tacotron2_PyT")
-    LOGGER.set_backends([
-        dllg.StdOutBackend(log_file=None,
-                           logging_scope=dllg.TRAIN_ITER_SCOPE, iteration_interval=1),
-        dllg.JsonBackend(log_file=args.log_file if args.rank == 0 else None,
-                         logging_scope=dllg.TRAIN_ITER_SCOPE, iteration_interval=1)
-    ])
+    if 'LOCAL_RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+    else:
+        local_rank = args.rank
+        world_size = args.world_size
 
-    LOGGER.timed_block_start("run")
-    LOGGER.register_metric(tags.TRAIN_ITERATION_LOSS,
-                           metric_scope=dllg.TRAIN_ITER_SCOPE)
-    LOGGER.register_metric("iter_time",
-                           metric_scope=dllg.TRAIN_ITER_SCOPE)
-    LOGGER.register_metric("epoch_time",
-                           metric_scope=dllg.EPOCH_SCOPE)
-    LOGGER.register_metric("run_time",
-                           metric_scope=dllg.RUN_SCOPE)
-    LOGGER.register_metric("val_iter_loss",
-                           metric_scope=dllg.EPOCH_SCOPE)
-    LOGGER.register_metric("train_epoch_items/sec",
-                           metric_scope=dllg.EPOCH_SCOPE)
-    LOGGER.register_metric("train_epoch_avg_loss",
-                           metric_scope=dllg.EPOCH_SCOPE)
+    distributed_run = world_size > 1
 
-    log_hardware()
+    if local_rank == 0:
+        DLLogger.init(backends=[JSONStreamBackend(Verbosity.DEFAULT,
+                                                  args.output+'/'+args.log_file),
+                                StdOutBackend(Verbosity.VERBOSE)])
+    else:
+        DLLogger.init(backends=[])
+
+    for k,v in vars(args).items():
+        DLLogger.log(step="PARAMETER", data={k:v})
+    DLLogger.log(step="PARAMETER", data={'model_name':'Tacotron2_PyT'})
 
     model_name = args.model_name
     parser = models.parse_model_args(model_name, parser)
-    parser.parse_args()
-
-    args = parser.parse_args()
-
-    log_args(args)
+    args, _ = parser.parse_known_args()
 
     torch.backends.cudnn.enabled = args.cudnn_enabled
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
 
-    distributed_run = args.world_size > 1
     if distributed_run:
-        init_distributed(args, args.world_size, args.rank, args.group_name)
+        init_distributed(args, world_size, local_rank, args.group_name)
 
-    LOGGER.log(key=tags.RUN_START)
-    run_start_time = time.time()
+    torch.cuda.synchronize()
+    run_start_time = time.perf_counter()
 
     model_config = models.get_model_config(model_name, args)
     model = models.get_model(model_name, model_config,
-                             to_fp16=args.fp16_run, to_cuda=True)
-    if distributed_run:
+                             to_cuda=True,
+                             uniform_initialize_bn_weight=not args.disable_uniform_initialize_bn_weight)
+
+    if not args.amp_run and distributed_run:
         model = DDP(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate,
                                  weight_decay=args.weight_decay)
 
-    if args.fp16_run:
-        optimizer = FP16_Optimizer(
-            optimizer, dynamic_loss_scale=args.dynamic_loss_scaling)
+    if args.amp_run:
+        model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+        if distributed_run:
+            model = DDP(model)
 
     try:
         sigma = args.sigma
     except AttributeError:
         sigma = None
+
+    start_epoch = [0]
+
+    if args.checkpoint_path is not "":
+        load_checkpoint(model, optimizer, start_epoch, model_config,
+                        args.amp_run, args.checkpoint_path, local_rank)
+
+    start_epoch = start_epoch[0]
 
     criterion = loss_functions.get_loss_function(model_name, sigma)
 
@@ -415,8 +369,14 @@ def main():
         model_name, n_frames_per_step)
     trainset = data_functions.get_data_loader(
         model_name, args.dataset_path, args.training_files, args)
-    train_sampler = DistributedSampler(trainset) if distributed_run else None
-    train_loader = DataLoader(trainset, num_workers=1, shuffle=False,
+    if distributed_run:
+        train_sampler = DistributedSampler(trainset)
+        shuffle = False
+    else:
+        train_sampler = None
+        shuffle = True
+
+    train_loader = DataLoader(trainset, num_workers=1, shuffle=shuffle,
                               sampler=train_sampler,
                               batch_size=args.batch_size, pin_memory=False,
                               drop_last=True, collate_fn=collate_fn)
@@ -427,47 +387,47 @@ def main():
     batch_to_gpu = data_functions.get_batch_to_gpu(model_name)
 
     iteration = 0
+    train_epoch_items_per_sec = 0.0
+    val_loss = 0.0
+    num_iters = 0
+
     model.train()
 
-    LOGGER.log(key=tags.TRAIN_LOOP)
-
-    for epoch in range(args.epochs):
-        LOGGER.epoch_start()
-        epoch_start_time = time.time()
-        LOGGER.log(key=tags.TRAIN_EPOCH_START, value=epoch)
-
+    for epoch in range(start_epoch, args.epochs):
+        torch.cuda.synchronize()
+        epoch_start_time = time.perf_counter()
         # used to calculate avg items/sec over epoch
         reduced_num_items_epoch = 0
 
         # used to calculate avg loss over epoch
         train_epoch_avg_loss = 0.0
+        train_epoch_items_per_sec = 0.0
+
         num_iters = 0
 
         # if overflow at the last iteration then do not save checkpoint
         overflow = False
 
-        for i, batch in enumerate(train_loader):
-            LOGGER.iteration_start()
-            iter_start_time = time.time()
-            LOGGER.log(key=tags.TRAIN_ITER_START, value=i)
-            print("Batch: {}/{} epoch {}".format(i, len(train_loader), epoch))
+        if distributed_run:
+            train_loader.sampler.set_epoch(epoch)
 
-            start = time.perf_counter()
-            adjust_learning_rate(epoch, optimizer, args.learning_rate,
-                                 args.anneal_steps, args.anneal_factor)
+        for i, batch in enumerate(train_loader):
+            torch.cuda.synchronize()
+            iter_start_time = time.perf_counter()
+            DLLogger.log(step=(epoch, i),
+                         data={'glob_iter/iters_per_epoch': str(iteration)+"/"+str(len(train_loader))})
+
+            adjust_learning_rate(iteration, epoch, optimizer, args.learning_rate,
+                                 args.anneal_steps, args.anneal_factor, local_rank)
 
             model.zero_grad()
             x, y, num_items = batch_to_gpu(batch)
 
-            if args.fp16_run:
-                y_pred = model(fp32_to_fp16(x))
-                loss = criterion(fp16_to_fp32(y_pred), y)
-            else:
-                y_pred = model(x)
-                loss = criterion(y_pred, y)
+            y_pred = model(x)
+            loss = criterion(y_pred, y)
 
             if distributed_run:
-                reduced_loss = reduce_tensor(loss.data, args.world_size).item()
+                reduced_loss = reduce_tensor(loss.data, world_size).item()
                 reduced_num_items = reduce_tensor(num_items.data, 1).item()
             else:
                 reduced_loss = loss.item()
@@ -475,7 +435,7 @@ def main():
             if np.isnan(reduced_loss):
                 raise Exception("loss is NaN")
 
-            LOGGER.log(key=tags.TRAIN_ITERATION_LOSS, value=reduced_loss)
+            DLLogger.log(step=(epoch,i), data={'train_loss': reduced_loss})
 
             train_epoch_avg_loss += reduced_loss
             num_iters += 1
@@ -483,9 +443,11 @@ def main():
             # accumulate number of items processed in this epoch
             reduced_num_items_epoch += reduced_num_items
 
-            if args.fp16_run:
-                optimizer.backward(loss)
-                grad_norm = optimizer.clip_master_grads(args.grad_clip_thresh)
+            if args.amp_run:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    amp.master_params(optimizer), args.grad_clip_thresh)
             else:
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -493,58 +455,47 @@ def main():
 
             optimizer.step()
 
-            overflow = optimizer.overflow if args.fp16_run else False
+            torch.cuda.synchronize()
+            iter_stop_time = time.perf_counter()
+            iter_time = iter_stop_time - iter_start_time
+            items_per_sec = reduced_num_items/iter_time
+            train_epoch_items_per_sec += items_per_sec
+
+            DLLogger.log(step=(epoch, i), data={'train_items_per_sec': items_per_sec})
+            DLLogger.log(step=(epoch, i), data={'train_iter_time': iter_time})
             iteration += 1
 
-            LOGGER.log(key=tags.TRAIN_ITER_STOP, value=i)
-
-            iter_stop_time = time.time()
-            iter_time = iter_stop_time - iter_start_time
-            LOGGER.log(key="train_iter_items/sec",
-                       value=(reduced_num_items/iter_time))
-            LOGGER.log(key="iter_time", value=iter_time)
-            LOGGER.iteration_stop()
-
-        LOGGER.log(key=tags.TRAIN_EPOCH_STOP, value=epoch)
-        epoch_stop_time = time.time()
+        torch.cuda.synchronize()
+        epoch_stop_time = time.perf_counter()
         epoch_time = epoch_stop_time - epoch_start_time
 
-        LOGGER.log(key="train_epoch_items/sec",
-                   value=(reduced_num_items_epoch/epoch_time))
-        LOGGER.log(key="train_epoch_avg_loss", value=(
-            train_epoch_avg_loss/num_iters if num_iters > 0 else 0.0))
-        LOGGER.log(key="epoch_time", value=epoch_time)
+        DLLogger.log(step=(epoch,), data={'train_items_per_sec':
+                                          (train_epoch_items_per_sec/num_iters if num_iters > 0 else 0.0)})
+        DLLogger.log(step=(epoch,), data={'train_loss': (train_epoch_avg_loss/num_iters if num_iters > 0 else 0.0)})
+        DLLogger.log(step=(epoch,), data={'train_epoch_time': epoch_time})
 
-        LOGGER.log(key=tags.EVAL_START, value=epoch)
+        val_loss = validate(model, criterion, valset, epoch, iteration,
+                            args.batch_size, world_size, collate_fn,
+                            distributed_run, local_rank, batch_to_gpu)
 
-        validate(model, criterion, valset, iteration,
-                 args.batch_size, args.world_size, collate_fn,
-                 distributed_run, args.rank, batch_to_gpu, args.fp16_run)
-
-        LOGGER.log(key=tags.EVAL_STOP, value=epoch)
-
-        if not overflow and (epoch % args.epochs_per_checkpoint == 0) and args.rank == 0:
+        if (epoch % args.epochs_per_checkpoint == 0) and local_rank == 0 and args.bench_class == "":
             checkpoint_path = os.path.join(
-                args.output_directory, "checkpoint_{}_{}".format(model_name, epoch))
-            save_checkpoint(model, epoch, model_config, checkpoint_path)
-            save_sample(model_name, model, args.waveglow_checkpoint,
-                        args.tacotron2_checkpoint, args.phrase_path,
-                        os.path.join(args.output_directory, "sample_{}_{}.wav".format(model_name, iteration)), args.sampling_rate, args.fp16_run)
+                args.output, "checkpoint_{}_{}".format(model_name, epoch))
+            save_checkpoint(model, optimizer, epoch, model_config,
+                            args.amp_run, checkpoint_path)
+        if local_rank == 0:
+            DLLogger.flush()
 
-        LOGGER.epoch_stop()
-
-    run_stop_time = time.time()
+    torch.cuda.synchronize()
+    run_stop_time = time.perf_counter()
     run_time = run_stop_time - run_start_time
-    LOGGER.log(key="run_time", value=run_time)
-    LOGGER.log(key=tags.RUN_FINAL)
+    DLLogger.log(step=tuple(), data={'run_time': run_time})
+    DLLogger.log(step=tuple(), data={'val_loss': val_loss})
+    DLLogger.log(step=tuple(), data={'train_items_per_sec':
+                                     (train_epoch_items_per_sec/num_iters if num_iters > 0 else 0.0)})
 
-    print("training time", run_stop_time - run_start_time)
-
-    LOGGER.timed_block_stop("run")
-
-    if args.rank == 0:
-        LOGGER.finish()
-
+    if local_rank == 0:
+        DLLogger.flush()
 
 if __name__ == '__main__':
     main()

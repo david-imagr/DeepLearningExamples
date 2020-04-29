@@ -69,7 +69,7 @@ class Invertible1x1Conv(torch.nn.Module):
         if reverse:
             if not hasattr(self, 'W_inverse'):
                 # Reverse computation
-                W_inverse = W.inverse()
+                W_inverse = W.float().inverse()
                 W_inverse = Variable(W_inverse[..., None])
                 if z.type() == 'torch.cuda.HalfTensor' or z.type() == 'torch.HalfTensor':
                     W_inverse = W_inverse.half()
@@ -78,12 +78,8 @@ class Invertible1x1Conv(torch.nn.Module):
             return z
         else:
             # Forward computation
-            log_det_W = torch.logdet(W)
-            log_det_W = batch_size * n_of_groups * log_det_W
-            if z.dtype == torch.float16:
-                z = self.conv(z.float()).half()
-            else:
-                z = self.conv(z)
+            log_det_W = batch_size * n_of_groups * torch.logdet(W.unsqueeze(0).float()).squeeze()
+            z = self.conv(z)
             return z, log_det_W
 
 
@@ -237,6 +233,7 @@ class WaveGlow(torch.nn.Module):
         return torch.cat(output_audio, 1), log_s_list, log_det_W_list
 
     def infer(self, spect, sigma=1.0):
+
         spect = self.upsample(spect)
         # trim conv artifacts. maybe pad spec to kernel multiple
         time_cutoff = self.upsample.kernel_size[0] - self.upsample.stride[0]
@@ -274,6 +271,7 @@ class WaveGlow(torch.nn.Module):
             0, 2, 1).contiguous().view(
             audio.size(0), -1).data
         return audio
+
 
     @staticmethod
     def remove_weightnorm(model):

@@ -23,121 +23,20 @@ Example:
 
 """
 
-import argparse
 import os
 
+import horovod.tensorflow as hvd
+import math
+import numpy as np
 import tensorflow as tf
+from PIL import Image
 
-from dllogger.logger import LOGGER
-
-from utils.runner import Runner
-
-PARSER = argparse.ArgumentParser(description="UNet-medical")
-
-PARSER.add_argument('--exec_mode',
-                    choices=['train', 'train_and_predict', 'predict', 'benchmark'],
-                    type=str,
-                    default='train_and_predict',
-                    help="""Which execution mode to run the model into"""
-                    )
-
-PARSER.add_argument('--model_dir',
-                    type=str,
-                    default='./results',
-                    help="""Output directory for information related to the model"""
-                    )
-
-PARSER.add_argument('--data_dir',
-                    type=str,
-                    required=True,
-                    help="""Input directory containing the dataset for training the model"""
-                    )
-
-PARSER.add_argument('--batch_size',
-                    type=int,
-                    default=1,
-                    help="""Size of each minibatch per GPU""")
-
-PARSER.add_argument('--max_steps',
-                    type=int,
-                    default=1000,
-                    help="""Maximum number of steps (batches) used for training""")
-
-PARSER.add_argument('--seed',
-                    type=int,
-                    default=0,
-                    help="""Random seed""")
-
-PARSER.add_argument('--weight_decay',
-                    type=float,
-                    default=0.0005,
-                    help="""Weight decay coefficient""")
-
-PARSER.add_argument('--log_every',
-                    type=int,
-                    default=100,
-                    help="""Log performance every n steps""")
-
-PARSER.add_argument('--warmup_steps',
-                    type=int,
-                    default=200,
-                    help="""Number of warmup steps""")
-
-PARSER.add_argument('--learning_rate',
-                    type=float,
-                    default=0.01,
-                    help="""Learning rate coefficient for SGD""")
-
-PARSER.add_argument('--momentum',
-                    type=float,
-                    default=0.99,
-                    help="""Momentum coefficient for SGD""")
-
-PARSER.add_argument('--decay_steps',
-                    type=float,
-                    default=5000,
-                    help="""Decay steps for inverse learning rate decay""")
-
-PARSER.add_argument('--decay_rate',
-                    type=float,
-                    default=0.95,
-                    help="""Decay rate for learning rate decay""")
-
-PARSER.add_argument('--augment', dest='augment', action='store_true',
-                    help="""Perform data augmentation during training""")
-PARSER.add_argument('--no-augment', dest='augment', action='store_false')
-PARSER.set_defaults(augment=False)
-
-PARSER.add_argument('--benchmark', dest='benchmark', action='store_true',
-                    help="""Collect performance metrics during training""")
-PARSER.add_argument('--no-benchmark', dest='benchmark', action='store_false')
-PARSER.set_defaults(augment=False)
-
-PARSER.add_argument('--use_amp', dest='use_amp', action='store_true',
-                    help="""Train using TF-AMP""")
-PARSER.set_defaults(use_amp=False)
-
-
-def _cmd_params(flags):
-    return {
-        'model_dir': flags.model_dir,
-        'batch_size': flags.batch_size,
-        'data_dir': flags.data_dir,
-        'max_steps': flags.max_steps,
-        'weight_decay': flags.weight_decay,
-        'dtype': tf.float32,
-        'learning_rate': flags.learning_rate,
-        'momentum': flags.momentum,
-        'benchmark': flags.benchmark,
-        'augment': flags.augment,
-        'exec_mode': flags.exec_mode,
-        'seed': flags.seed,
-        'use_amp': flags.use_amp,
-        'log_every': flags.log_every,
-        'warmup_steps': flags.warmup_steps,
-        'decay_steps': flags.decay_steps,
-        'decay_rate': flags.decay_rate,
-    }
+from utils.cmd_util import PARSER, _cmd_params
+from utils.data_loader import Dataset
+from utils.hooks.profiling_hook import ProfilingHook
+from utils.hooks.training_hook import TrainingHook
+from utils.model_fn import unet_fn
+from dllogger.logger import Logger, StdOutBackend, JSONStreamBackend, Verbosity
 
 
 def main(_):
@@ -146,10 +45,15 @@ def main(_):
     """
 
     flags = PARSER.parse_args()
-
     params = _cmd_params(flags)
+    np.random.seed(params.seed)
+    tf.compat.v1.random.set_random_seed(params.seed)
+    tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
-    tf.logging.set_verbosity(tf.logging.ERROR)
+    backends = [StdOutBackend(Verbosity.VERBOSE)]
+    if params.log_dir is not None:
+        backends.append(JSONStreamBackend(Verbosity.VERBOSE, params.log_dir))
+    logger = Logger(backends)
 
     # Optimization flags
     os.environ['CUDA_CACHE_DISABLE'] = '0'
@@ -160,33 +64,112 @@ def main(_):
 
     os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
 
-    os.environ['TF_USE_CUDNN_BATCHNORM_SPATIAL_PERSISTENT'] = '1'
+    os.environ['TF_USE_CUDNN_BATCHNORM_SPATIAL_PERSISTENT'] = 'data'
 
-    os.environ['TF_ADJUST_HUE_FUSED'] = '1'
-    os.environ['TF_ADJUST_SATURATION_FUSED'] = '1'
-    os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
+    os.environ['TF_ADJUST_HUE_FUSED'] = 'data'
+    os.environ['TF_ADJUST_SATURATION_FUSED'] = 'data'
+    os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = 'data'
 
     os.environ['TF_SYNC_ON_FINISH'] = '0'
     os.environ['TF_AUTOTUNE_THRESHOLD'] = '2'
-    os.environ['TF_DISABLE_NVTX_RANGES'] = '1'
 
-    if params['use_amp']:
-        assert params['dtype'] == tf.float32, "TF-AMP requires FP32 precision"
-
-        LOGGER.log("TF AMP is activated - Experimental Feature")
+    if params.use_amp:
         os.environ['TF_ENABLE_AUTO_MIXED_PRECISION'] = '1'
+    else:
+        os.environ['TF_ENABLE_AUTO_MIXED_PRECISION'] = '0'
+    hvd.init()
 
-    runner = Runner(params)
+    # Build run config
+    gpu_options = tf.compat.v1.GPUOptions()
+    config = tf.compat.v1.ConfigProto(gpu_options=gpu_options, allow_soft_placement=True)
 
-    if 'train' in params['exec_mode'] \
-            or 'train_and predict' in params['exec_mode']:
-        runner.train()
-    if 'train_and predict' in params['exec_mode'] \
-            or 'predict' in params['exec_mode']:
-        runner.predict()
-    if 'benchmark' in params['exec_mode']:
-        runner.benchmark()
+    if params.use_xla:
+        config.graph_options.optimizer_options.global_jit_level = tf.compat.v1.OptimizerOptions.ON_1
+
+    config.gpu_options.allow_growth = True
+    config.gpu_options.visible_device_list = str(hvd.local_rank())
+
+    run_config = tf.estimator.RunConfig(
+        save_summary_steps=1,
+        tf_random_seed=None,
+        session_config=config,
+        save_checkpoints_steps=params.max_steps // hvd.size(),
+        keep_checkpoint_max=1)
+
+    # Build the estimator model
+    estimator = tf.estimator.Estimator(
+        model_fn=unet_fn,
+        model_dir=params.model_dir,
+        config=run_config,
+        params=params)
+
+    dataset = Dataset(data_dir=params.data_dir,
+                      batch_size=params.batch_size,
+                      fold=params.crossvalidation_idx,
+                      augment=params.augment,
+                      gpu_id=hvd.rank(),
+                      num_gpus=hvd.size(),
+                      seed=params.seed)
+
+    if 'train' in params.exec_mode:
+        max_steps = params.max_steps // (1 if params.benchmark else hvd.size())
+        hooks = [hvd.BroadcastGlobalVariablesHook(0),
+                 TrainingHook(logger,
+                              max_steps=max_steps,
+                              log_every=params.log_every)]
+
+        if params.benchmark and hvd.rank() == 0:
+            hooks.append(ProfilingHook(logger,
+                                       batch_size=params.batch_size,
+                                       log_every=params.log_every,
+                                       warmup_steps=params.warmup_steps,
+                                       mode='train'))
+
+        estimator.train(
+            input_fn=dataset.train_fn,
+            steps=max_steps,
+            hooks=hooks)
+
+    if 'evaluate' in params.exec_mode:
+        if hvd.rank() == 0:
+            results = estimator.evaluate(input_fn=dataset.eval_fn, steps=dataset.eval_size)
+            logger.log(step=(),
+                       data={"eval_ce_loss": float(results["eval_ce_loss"]),
+                             "eval_dice_loss": float(results["eval_dice_loss"]),
+                             "eval_total_loss": float(results["eval_total_loss"]),
+                             "eval_dice_score": float(results["eval_dice_score"])})
+
+    if 'predict' in params.exec_mode:
+        if hvd.rank() == 0:
+            predict_steps = dataset.test_size
+            hooks = None
+            if params.benchmark:
+                hooks = [ProfilingHook(logger,
+                                       batch_size=params.batch_size,
+                                       log_every=params.log_every,
+                                       warmup_steps=params.warmup_steps,
+                                       mode="test")]
+                predict_steps = params.warmup_steps * 2 * params.batch_size
+
+            predictions = estimator.predict(
+                input_fn=lambda: dataset.test_fn(count=math.ceil(predict_steps / dataset.test_size)),
+                hooks=hooks)
+            binary_masks = [np.argmax(p['logits'], axis=-1).astype(np.uint8) * 255 for p in predictions]
+
+            if not params.benchmark:
+                multipage_tif = [Image.fromarray(mask).resize(size=(512, 512), resample=Image.BILINEAR)
+                                 for mask in binary_masks]
+
+                output_dir = os.path.join(params.model_dir, 'pred')
+
+                if not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+
+                multipage_tif[0].save(os.path.join(output_dir, 'test-masks.tif'),
+                                      compression="tiff_deflate",
+                                      save_all=True,
+                                      append_images=multipage_tif[1:])
 
 
 if __name__ == '__main__':
-    tf.app.run()
+    tf.compat.v1.app.run()
